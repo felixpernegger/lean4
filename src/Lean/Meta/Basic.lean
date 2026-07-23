@@ -377,6 +377,20 @@ structure SynthInstanceCacheKey where
   localInsts        : LocalInstances
   type              : Expr
   /--
+  For a normalized (`.noMVars`, fvar-typed) query, the canonical types of the free variables
+  referenced by `type`/`localInsts`, indexed by their canonical position (see the fvar
+  normalization in `SynthInstance.lean`). Free variables in `type` and `localInsts` are renamed
+  to positional canonical identifiers, so structurally identical queries in different local
+  contexts share a cache entry. Empty for non-normalized (raw) keys.
+  -/
+  normFVarTypes     : Array Expr := #[]
+  /--
+  For each closure position, the canonical value of that free variable if it is let-bound, and
+  `none` otherwise. A let-bound variable's value is visible to definitional unfolding, so contexts
+  that agree on the types but not the values are not interchangeable. Empty for raw keys.
+  -/
+  normFVarValues    : Array (Option Expr) := #[]
+  /--
   Value of `synthPendingDepth` when instance was synthesized or failed to be synthesized.
   See issue #2522.
   -/
@@ -463,6 +477,38 @@ We should also investigate the impact on memory consumption.
 abbrev DefEqCache := PersistentHashMap DefEqCacheKey Bool
 
 /--
+The free-variable normalization of a local instance context: the canonical position of every free
+variable reachable from the local instances (transitively via their types), that variable's
+recursively normalized type, and the local instances themselves over the canonical variables. See
+the normalization in `SynthInstance.lean`.
+-/
+structure SynthNormClosure where
+  fmap            : PersistentHashMap FVarId Nat
+  order           : Array FVarId
+  types           : Array Expr
+  /-- The canonical value of each let-bound closure variable; `none` for the others. -/
+  values          : Array (Option Expr)
+  canonLocalInsts : LocalInstances
+
+/--
+`SynthNormClosure` memoized for the local instances it was computed from. The closure does not
+depend on the query, so every type class query made under the same local instances shares it;
+recomputing it per query dominates the cost of building a cache key.
+-/
+structure SynthNormClosureMemo where
+  /-- The local instances the closure was computed for. -/
+  localInsts : LocalInstances
+  /--
+  The closure variables whose raw `LocalDecl` type or let-value mentions a metavariable, with the
+  instantiation the closure was built from (`true` = the value, `false` = the type). A `LocalDecl`
+  is immutable, so only these can change: a metavariable may be assigned, or an assignment reverted
+  by backtracking.
+  -/
+  mvarTyped : Array (FVarId × Bool × Expr)
+  /-- `none` if the local instance context cannot be soundly normalized. -/
+  closure? : Option SynthNormClosure
+
+/--
 Cache datastructures for type inference, type class resolution, whnf, and definitional equality.
 
 The `synthInstance` field is the *transient* tier of the type class resolution cache: it has
@@ -478,6 +524,12 @@ structure Cache where
   whnf           : WhnfCache := {}
   defEqTrans     : DefEqCache := {} -- transient cache for terms containing mvars or using nonstandard configuration options, it is frequently reset.
   defEqPerm      : DefEqCache := {} -- permanent cache for terms not containing mvars and using standard configuration options
+  /--
+  One-slot memo for the free-variable normalization of the local instance context; see
+  `SynthNormClosureMemo`. One slot suffices because the local instances change rarely relative to
+  the number of type class queries made under them.
+  -/
+  synthNormClosure : Option SynthNormClosureMemo := none
   deriving Inhabited
 
 /--
@@ -742,13 +794,13 @@ def resetCache : MetaM Unit :=
   modifyCache fun _ => {}
 
 @[inline] def modifyInferTypeCache (f : InferTypeCache → InferTypeCache) : MetaM Unit :=
-  modifyCache fun ⟨ic, c1, c2, c3, c4, c5⟩ => ⟨f ic, c1, c2, c3, c4, c5⟩
+  modifyCache fun ⟨ic, c1, c2, c3, c4, c5, c6⟩ => ⟨f ic, c1, c2, c3, c4, c5, c6⟩
 
 @[inline] def modifyDefEqTransientCache (f : DefEqCache → DefEqCache) : MetaM Unit :=
-  modifyCache fun ⟨c1, c2, c3, c4, defeqTrans, c5⟩ => ⟨c1, c2, c3, c4, f defeqTrans, c5⟩
+  modifyCache fun ⟨c1, c2, c3, c4, defeqTrans, c5, c6⟩ => ⟨c1, c2, c3, c4, f defeqTrans, c5, c6⟩
 
 @[inline] def modifyDefEqPermCache (f : DefEqCache → DefEqCache) : MetaM Unit :=
-  modifyCache fun ⟨c1, c2, c3, c4, c5, defeqPerm⟩ => ⟨c1, c2, c3, c4, c5, f defeqPerm⟩
+  modifyCache fun ⟨c1, c2, c3, c4, c5, defeqPerm, c6⟩ => ⟨c1, c2, c3, c4, c5, f defeqPerm, c6⟩
 
 def mkExprConfigCacheKey (expr : Expr) : MetaM ExprConfigCacheKey :=
   return { expr, configKey := (← read).configKey }

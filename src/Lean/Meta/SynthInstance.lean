@@ -976,7 +976,7 @@ private def applyCachedAbstractResult? (type : Expr) (abstResult? : Option Abstr
     applyAbstractResult? type abstResult?
 
 /-- Helper function for caching synthesized type class instances. -/
-private def cacheResult (cacheKey : SynthInstanceCacheKey) (kind : PreprocessKind) (abstResult? : Option AbstractMVarsResult) (result? : Option Expr) : MetaM Unit := do
+private def cacheResult (cacheKey : SynthInstanceCacheKey) (kind : PreprocessKind) (normalized : Bool) (abstResult? : Option AbstractMVarsResult) (result? : Option Expr) : MetaM Unit := do
   -- The stored value: for a closed result we store the concrete `result` expr with an empty
   -- `AbstractMVarsResult` so that `applyCachedAbstractResult?` can skip re-`check`ing it.
   let value? :=
@@ -987,19 +987,234 @@ private def cacheResult (cacheKey : SynthInstanceCacheKey) (kind : PreprocessKin
         result?.map fun result => { expr := result, paramNames := #[], mvars := #[] }
       else
         some abstResult
-  -- Only context-free entries may be persisted: a mvar-free key (`.noMVars`), no free variable in
-  -- the key or the value, and a closed value (no abstracted metavariables); see
-  -- `insertCachedResult`.
+  -- Only context-free entries may be persisted: a key without metavariables, a key that does not
+  -- depend on the identity of any free variable, and a closed value (no abstracted metavariables,
+  -- no free variables); see `insertCachedResult`.
   --
-  -- A free variable identifies a variable only within the `NameGenerator` that created it, and the
-  -- cache outlives any of them: the pretty printer and the info tree each run with a fresh
-  -- generator (`PPContext.runCoreM`), so a delaborator that synthesizes an instance produces the
-  -- very same `FVarId`s in every command. An entry keyed by one would then be served to an
-  -- unrelated query over an identically named but differently typed variable.
-  let persist := kind matches .noMVars &&
-    cacheKey.localInsts.isEmpty && !cacheKey.type.hasFVar &&
+  -- The key is tested for metavariables directly rather than through `.noMVars`. An
+  -- `.mvarsOutputParams` query has its output parameters replaced by a wildcard in the key, so the
+  -- key is metavariable-free whenever every metavariable sits in an output parameter, even though
+  -- the query itself is not. Such an entry is as context-free as a `.noMVars` one: the wildcard
+  -- stands for a value the input parameters determine, and a hit re-derives it by unifying the
+  -- cached result against the query (`assignOutParams`).
+  --
+  -- A `normalized` key names its free variables by canonical position and records their types in
+  -- `normFVarTypes`, so it is context-free even though it mentions free variables. A raw key is
+  -- context-free only if it mentions none: an `FVarId` identifies a variable only within the
+  -- `NameGenerator` that created it, and the cache outlives any of them.
+  let persist := !cacheKey.type.hasMVar &&
+    (normalized || (cacheKey.localInsts.isEmpty && !cacheKey.type.hasFVar)) &&
     (value?.all fun r => r.numMVars == 0 && r.paramNames.isEmpty && !r.expr.hasFVar)
   insertCachedResult cacheKey value? (persist := persist)
+
+/-!
+Free-variable normalization of the cache key and result. Two `.noMVars` queries that are
+structurally identical up to the identities of their free variables (e.g. `Foo α` under `[Foo α]`
+vs. `Foo β` under `[Foo β]`) are made to share a single cache entry: every free variable reachable
+from the query type and the local instances is renamed to a canonical positional identifier, and
+the result is stored over the same canonical variables and re-instantiated with the current
+context's free variables on a hit.
+
+This is sound because a hit means the normalized key components are `BEq`-equal, i.e. the two
+contexts are identical up to free-variable renaming, and the synthesized result only mentions free
+variables in that closure (the query's variables and the local instances). Queries that cannot be
+soundly normalized fall back to the raw (unnormalized) key: see `normalizeContext?`.
+-/
+namespace SynthNorm
+
+/-- Canonical positional free-variable identifier used in the normalized cache key. -/
+private def canonFVarId (i : Nat) : FVarId := ⟨.mkNum `_snf i⟩
+
+private structure State where
+  /-- Assigns each source free variable its canonical position. Persistent, so that a memoized
+  closure seeds a query's state in constant time. -/
+  fmap  : PersistentHashMap FVarId Nat := {}
+  /-- Canonical position to source free variable (inverse of `fmap`), for re-instantiation. -/
+  order : Array FVarId := #[]
+  /-- Canonical position to the (recursively normalized) type of that free variable. -/
+  types : Array Expr := #[]
+  /-- Canonical position to the normalized value of that free variable, if it is let-bound. -/
+  values : Array (Option Expr) := #[]
+  /-- Set when the closure cannot be soundly normalized (let-bound or mvar-typed variable). -/
+  bail  : Bool := false
+  /-- Closure variables whose raw `LocalDecl` type or let-value mentions a metavariable, with the
+  instantiation used; see `SynthNormClosureMemo.mvarTyped`. -/
+  mvarTyped : Array (FVarId × Bool × Expr) := #[]
+  /--
+  Memoizes `normExpr` on visited subterms so that terms with DAG sharing are traversed in DAG
+  size, not tree size. Sound because positions are assigned by first occurrence and never change:
+  revisiting a subterm yields the same normalization. Keyed structurally (`ExprStructEq` hashes
+  are cached and its equality short-circuits on pointer identity).
+  -/
+  cache : Std.HashMap ExprStructEq Expr := {}
+
+private abbrev M := ReaderT LocalContext (StateT State MetaM)
+
+/--
+Renames every free variable to a canonical positional identifier by first-occurrence order,
+recording and recursively normalizing each one's type, and its value if it is let-bound. Sets
+`bail` on a variable whose type or value contains an unassigned metavariable, which is not
+context-free and so cannot be soundly normalized.
+-/
+private partial def normExpr (e : Expr) : M Expr := do
+  if (← get).bail then return e
+  unless e.hasFVar do return e
+  match e with
+  | .fvar id =>
+    if let some i := (← get).fmap.find? id then
+      return .fvar (canonFVarId i)
+    -- `preprocess` puts this marker in output-parameter positions; it is a constant, not a
+    -- variable of the local context, and must not be renamed (nor bail the normalization).
+    if id.name == `__wild__ then return e
+    match (← read).find? id with
+    | none =>
+      modify fun s => { s with bail := true }
+      return e
+    | some decl =>
+      -- `Expr.hasMVar` is a syntactic flag: it stays set for metavariables that are already
+      -- assigned, whose values are context-free. Instantiate before deciding to bail. The result is
+      -- recorded even when we bail below: assigning the metavariable that made us bail must
+      -- invalidate the memoized closure.
+      let inst (isValue : Bool) (e : Expr) : M Expr := do
+        unless e.hasMVar do return e
+        let e ← instantiateMVars e
+        modify fun s => { s with mvarTyped := s.mvarTyped.push (id, isValue, e) }
+        return e
+      let type ← inst false decl.type
+      -- A nondependent `ldecl` (`have`) hides its value from definitional unfolding, so
+      -- `LocalDecl.value?` reports none and the value stays out of the key.
+      let value? ← match decl.value? with
+        | none   => pure none
+        | some v => do
+          let v ← inst true v
+          pure (some v)
+      if type.hasMVar || (match value? with | some v => v.hasMVar | none => false) then
+        modify fun s => { s with bail := true }
+        return e
+      let i := (← get).order.size
+      modify fun s =>
+        { s with fmap := s.fmap.insert id i, order := s.order.push id,
+                 types := s.types.push default, values := s.values.push none }
+      let nty ← normExpr type
+      let nval? ← match value? with
+        | none   => pure none
+        | some v => do
+          let v ← normExpr v
+          pure (some v)
+      modify fun s => { s with types := s.types.set! i nty, values := s.values.set! i nval? }
+      return .fvar (canonFVarId i)
+  | _ =>
+    if let some r := (← get).cache[(e : ExprStructEq)]? then
+      return r
+    let r ← match e with
+      | .app f a          => pure <| .app (← normExpr f) (← normExpr a)
+      | .lam n d b bi     => pure <| .lam n (← normExpr d) (← normExpr b) bi
+      | .forallE n d b bi => pure <| .forallE n (← normExpr d) (← normExpr b) bi
+      | .letE n t v b nd  => pure <| .letE n (← normExpr t) (← normExpr v) (← normExpr b) nd
+      | .mdata m b        => pure <| .mdata m (← normExpr b)
+      | .proj s i b       => pure <| .proj s i (← normExpr b)
+      | e                 => pure e
+    modify fun s => { s with cache := s.cache.insert e r }
+    return r
+
+/-- The free-variable-normalized cache context for a query; see `normalizeContext?`. -/
+structure Context where
+  normType        : Expr
+  canonLocalInsts : LocalInstances
+  fvarTypes       : Array Expr
+  fvarValues      : Array (Option Expr)
+  fmap            : PersistentHashMap FVarId Nat
+  order           : Array FVarId
+
+/--
+Whether a memoized closure is still valid: every closure variable whose type mentions a
+metavariable must still instantiate to what the closure was built from. The other closure
+variables have immutable types, and the local instances are compared by the caller.
+-/
+private def isValidMemo (lctx : LocalContext) (memo : SynthNormClosureMemo) : MetaM Bool := do
+  for (id, isValue, e) in memo.mvarTyped do
+    let some decl := lctx.find? id | return false
+    let some raw := (if isValue then decl.value? else some decl.type) | return false
+    unless (← instantiateMVars raw) == e do return false
+  return true
+
+/--
+The free-variable-normalized closure of the local instances, or `none` if it cannot be soundly
+normalized. Memoized in `Meta.Cache.synthNormClosure`: the closure is the same for every query made
+under the same local instances, and normalizing it per query dominates the cost of a cache key.
+-/
+private def getClosure? (localInsts : LocalInstances) : MetaM (Option SynthNormClosure) := do
+  let lctx ← getLCtx
+  let cache := (← get).cache
+  if let some memo := cache.synthNormClosure then
+    if memo.localInsts == localInsts && (← isValidMemo lctx memo) then
+      return memo.closure?
+  let go : M LocalInstances :=
+    localInsts.mapM fun li => return { li with fvar := ← normExpr li.fvar }
+  let (canonLocalInsts, st) ← go.run lctx |>.run {}
+  let closure? :=
+    if st.bail then none
+    else some { fmap := st.fmap, order := st.order, types := st.types, values := st.values,
+                canonLocalInsts }
+  modifyCache fun c =>
+    { c with synthNormClosure := some { localInsts, mvarTyped := st.mvarTyped, closure? } }
+  return closure?
+
+/--
+Computes the free-variable-normalized cache context for a `.noMVars` query, or `none` if it cannot
+be soundly normalized (some free variable in the closure has an unassigned metavariable in its type
+or value). The closure comprises the free variables of the local instances and of `cacheKeyType`,
+together with their types, transitively. The local instances are normalized first, so that their
+part of the closure does not depend on the query and can be memoized; see `getClosure?`.
+-/
+def normalizeContext? (cacheKeyType : Expr) (localInsts : LocalInstances) :
+    MetaM (Option Context) := do
+  let some closure ← getClosure? localInsts | return none
+  let lctx ← getLCtx
+  -- Seed from the memoized closure; the query type may extend it with further free variables.
+  let st0 : State := { fmap := closure.fmap, order := closure.order, types := closure.types,
+                       values := closure.values }
+  let (normType, st) ← (normExpr cacheKeyType).run lctx |>.run st0
+  if st.bail then return none
+  return some { normType, canonLocalInsts := closure.canonLocalInsts, fvarTypes := st.types,
+                fvarValues := st.values, fmap := st.fmap, order := st.order }
+
+/--
+Abstracts the closure free variables of `e` into loose bound variables (positional, by the closure
+`order`), or `none` if `e` mentions a free variable outside the closure (in which case the value is
+context-dependent beyond its key and must not be reused).
+
+The abstracted value contains no context-specific free variables, so it is safe to store in the
+shared cache and re-instantiate in a different context (cf. `reopen`), analogously to how
+`abstractMVars` produces a closed schema. `.noMVars` results have no abstracted metavariables, so
+`e` never wraps the value in metavariable binders and this abstraction composes with the universe
+handling in `openAbstractMVarsResult`.
+-/
+def abstractOverClosure? (ctx : Context) (e : Expr) : Option Expr :=
+  -- Abstract first, then check the (cached) `hasFVar` flag of the result: any remaining free
+  -- variable is outside the closure. Unlike `hasAnyFVar`, this is linear in the DAG size of `e`.
+  let e := e.abstract (ctx.order.map Expr.fvar)
+  if e.hasFVar then none else some e
+
+/-- Abstracts the free variables of a cache value, or `none` if the result escapes the closure. -/
+def abstractValue? (ctx : Context) (abstResult? : Option AbstractMVarsResult) (result? : Option Expr) :
+    Option (Option AbstractMVarsResult × Option Expr) := do
+  let abstResult? ← match abstResult? with
+    | none   => some none
+    | some a => (abstractOverClosure? ctx a.expr).map fun e => some { a with expr := e }
+  let result? ← match result? with
+    | none   => some none
+    | some r => (abstractOverClosure? ctx r).map some
+  some (abstResult?, result?)
+
+/--
+Re-instantiates a closure-abstracted value (see `abstractOverClosure?`) with the current context's
+closure free variables `order`.
+-/
+def reopen (order : Array FVarId) (e : Expr) : Expr :=
+  e.instantiateRev (order.map Expr.fvar)
+
+end SynthNorm
 
 /--
 The `Meta.Config` used for all type class resolution. The ambient configuration is replaced
@@ -1044,14 +1259,27 @@ def synthInstanceCore? (type : Expr) (maxResultSize? : Option Nat := none) : Met
     let localInsts ← getLocalInstances
     let type ← instantiateMVars type
     let { type, cacheKeyType, kind } ← preprocess type
+    -- Normalize the free variables of the key and result so that structurally identical queries in
+    -- different local contexts share a cache entry. Metavariables are left exactly as they are, so
+    -- this applies to metavariable-laden queries as well: their keys are otherwise context-specific
+    -- and can never be shared. `.mvarsOutputParams` keys have their output parameters replaced by a
+    -- wildcard already, so they are usually metavariable-free apart from it.
+    let normCtx? ← SynthNorm.normalizeContext? cacheKeyType localInsts
     let cacheKey := { localInsts, type := cacheKeyType, synthPendingDepth := (← read).synthPendingDepth,
                       activeScopedInsts := instanceExtension.getActiveScopesWithEntries (← getEnv),
                       localAttrInsts := instanceExtension.getState (← getEnv) |>.localInstanceNames,
                       maxResultSize, relevantOptions := synthRelevantOptions opts,
                       isExporting := (← getEnv).isExporting }
+    let cacheKey := match normCtx? with
+      | some c => { cacheKey with localInsts := c.canonLocalInsts, type := c.normType, normFVarTypes := c.fvarTypes, normFVarValues := c.fvarValues }
+      | none   => cacheKey
     match ← findCachedResult? cacheKey with
     | some abstResult? =>
       trace[Meta.synthInstance.cache] "cached: {type}"
+      -- Re-instantiate the closure-abstracted result with the current context's free variables.
+      let abstResult? := match normCtx? with
+        | some c => abstResult?.map fun a => { a with expr := SynthNorm.reopen c.order a.expr }
+        | none   => abstResult?
       let result? ← applyCachedAbstractResult? type abstResult?
       trace[Meta.synthInstance] "result {result?} (cached)"
       return result?
@@ -1084,7 +1312,14 @@ def synthInstanceCore? (type : Expr) (maxResultSize? : Option Nat := none) : Met
         | .mvarsOutputParams => SynthInstance.main (← preprocessOutParam type) maxResultSize
       let result? ← applyAbstractResult? type abstResult?
       trace[Meta.synthInstance] "result {result?}"
-      cacheResult cacheKey kind abstResult? result?
+      match normCtx? with
+      | none   => cacheResult cacheKey kind (normalized := false) abstResult? result?
+      | some c =>
+        -- Store the result over the canonical closure variables; skip caching (this query only) if
+        -- the result escapes the closure and so is not context-free.
+        match SynthNorm.abstractValue? c abstResult? result? with
+        | some (nAbstResult?, nResult?) => cacheResult cacheKey kind (normalized := true) nAbstResult? nResult?
+        | none => pure ()
       return result?
 
 def synthInstance? (type : Expr) (maxResultSize? : Option Nat := none) : MetaM (Option Expr) := do profileitM Exception "typeclass inference" (← getOptions) (decl := type.getAppFn.constName?.getD .anonymous) do
