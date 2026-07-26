@@ -32,6 +32,11 @@ register_builtin_option backward.synthInstance.canonInstances : Bool := {
   descr := "use optimization that relies on 'morally canonical' instances during type class resolution"
 }
 
+register_builtin_option backward.synthInstance.rawKeyCache : Bool := {
+  defValue := true
+  descr := "additionally memoize type class resolution results under the unnormalized cache key, so that repeated queries in one context return the same result object"
+}
+
 namespace SynthInstance
 
 def getMaxHeartbeats (opts : Options) : Nat :=
@@ -1270,9 +1275,22 @@ def synthInstanceCore? (type : Expr) (maxResultSize? : Option Nat := none) : Met
                       localAttrInsts := instanceExtension.getState (← getEnv) |>.localInstanceNames,
                       maxResultSize, relevantOptions := synthRelevantOptions opts,
                       isExporting := (← getEnv).isExporting }
+    let rawKey := cacheKey
     let cacheKey := match normCtx? with
       | some c => { cacheKey with localInsts := c.canonLocalInsts, type := c.normType, normFVarTypes := c.fvarTypes, normFVarValues := c.fvarValues }
       | none   => cacheKey
+    let rawKeyCache := backward.synthInstance.rawKeyCache.get opts
+    -- Raw-key front-cache: repeated queries in one context must return the *same* result object.
+    -- A normalized hit re-instantiates the stored schema (`SynthNorm.reopen`), which allocates a
+    -- fresh copy per hit; consumers that rely on pointer identity for sharing (e.g. `grind`'s
+    -- alpha-sharing) would pay deep structural work for every copy. The transient tier therefore
+    -- additionally memoizes the reopened result under the unnormalized key.
+    if rawKeyCache && normCtx?.isSome then
+      if let some abstResult? := (← get).cache.synthInstance.find? rawKey then
+        trace[Meta.synthInstance.cache] "cached: {type}"
+        let result? ← applyCachedAbstractResult? type abstResult?
+        trace[Meta.synthInstance] "result {result?} (cached)"
+        return result?
     match ← findCachedResult? cacheKey with
     | some abstResult? =>
       trace[Meta.synthInstance.cache] "cached: {type}"
@@ -1280,6 +1298,8 @@ def synthInstanceCore? (type : Expr) (maxResultSize? : Option Nat := none) : Met
       let abstResult? := match normCtx? with
         | some c => abstResult?.map fun a => { a with expr := SynthNorm.reopen c.order a.expr }
         | none   => abstResult?
+      if rawKeyCache && normCtx?.isSome then
+        modifyCache fun c => { c with synthInstance := c.synthInstance.insert rawKey abstResult? }
       let result? ← applyCachedAbstractResult? type abstResult?
       trace[Meta.synthInstance] "result {result?} (cached)"
       return result?
@@ -1315,6 +1335,10 @@ def synthInstanceCore? (type : Expr) (maxResultSize? : Option Nat := none) : Met
       match normCtx? with
       | none   => cacheResult cacheKey kind (normalized := false) abstResult? result?
       | some c =>
+        -- The context-level result goes under the raw key (see the front-cache above), including
+        -- when the abstraction below fails: an escaping result is still valid in this context.
+        if rawKeyCache then
+          modifyCache fun cch => { cch with synthInstance := cch.synthInstance.insert rawKey abstResult? }
         -- Store the result over the canonical closure variables; skip caching (this query only) if
         -- the result escapes the closure and so is not context-free.
         match SynthNorm.abstractValue? c abstResult? result? with
