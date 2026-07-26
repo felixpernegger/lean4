@@ -290,7 +290,12 @@ jobs:
                 // portable release build: use channel with older glibc (2.26)
                 "name": "Linux release",
                 "os": large ? chonk : "ubuntu-latest",
-                "release": true,
+                // A release build stamps the commit githash into its `.olean`s and enforces it, which
+                // makes every artifact commit-specific and thus unusable to the caches. PR CI builds
+                // unstamped so it can reuse them; the merge queue and above still build as shipped.
+                "release": level >= 1,
+                // ... but PR builds are still published by `pr-release.yml`, so pack and upload them.
+                "upload": true,
                 "enabled": true,
                 "check-rebootstrap": level >= 1,
                 // Done as part of test-bench
