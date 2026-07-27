@@ -147,6 +147,20 @@ private def liftedHypBare? (scope : VCGen.Scope) (goal : MVarId) (target : Expr)
     goal.assign hyp.toExpr
     return some []
 
+/-- Instantiate an assigned head metavariable in the carrier or either side of the entailment
+`pre ⊑ rhs` and replace the target, so the shape tests in the following steps (`isForall` in
+`introsExcessArgs`, `isProp` in `barePreIntro?`, the connective and `wp` matches) see the assigned
+form. A rule application can leave any of the three behind, e.g. a lattice-split operand, or the
+dependent codomain of `le_of_forall_le` as the carrier. -/
+private def instantiateGoal? (goal : MVarId) (target α inst pre rhs : Expr) :
+    VCGenM (Option MVarId) := do
+  let α' ← instantiateMVarsIfMVarAppS α
+  let pre' ← instantiateMVarsIfMVarAppS pre
+  let rhs' ← instantiateMVarsIfMVarAppS rhs
+  if isSameExpr α α' && isSameExpr pre pre' && isSameExpr rhs rhs' then return none
+  let target ← mkAppNS target.getAppFn #[α', inst, pre', rhs']
+  return some (← goal.replaceTargetDefEqFast target)
+
 /-- Strategy 5: cancel a redundant `P ⊓ ⊤` precondition via `meet_top_le_of_le`, leaving `P ⊑ rhs`.
 Such a precondition arises when `himp_complete` splits `⊤ ⊑ a ⇨ b` into `a ⊓ ⊤ ⊑ b`. -/
 private def stripMeetTopPre? (goal : MVarId) (pre : Expr) : VCGenM (Option MVarId) := do
@@ -163,6 +177,26 @@ private def ofPropPreIntro? (goal : MVarId) (pre : Expr) : VCGenM (Option (MVarI
   let_expr CompleteLattice.ofProp _l _inst φ := pre | return none
   if φ.isTrue then return none
   return some (← introPre (← read).backwardRules.ofPropPreIntro goal)
+
+/-- Strategy 5: lift the guard of a `⌜φ⌝ ⊓ P` precondition into the local context via
+`ofProp_meet_le`, leaving `P ⊑ rhs`. Returns the new goal and the hypothesis, or `none` when the
+rule does not apply (e.g. the goal's instances do not unify with the rule's). -/
+private def ofPropMeetPreIntro? (goal : MVarId) (pre : Expr) : VCGenM (Option (MVarId × FVarId)) := do
+  let_expr Lean.Order.meet _l _inst lhs _rest := pre | return none
+  let_expr CompleteLattice.ofProp _l' _inst' _φ := lhs | return none
+  let .goals [goal] ← (← read).backwardRules.ofPropMeetPreIntro.apply goal | return none
+  let goal ← introsHygienic goal
+  let some decl := (← goal.withContext getLCtx).lastDecl
+    | throwError "Failed to intro the lifted precondition of {goal}"
+  return (goal, decl.fvarId)
+
+/-- Strategy 5: eliminate an `iSup` precondition via `iSup_le`, leaving the pointwise entailment
+`∀ i, P i ⊑ rhs` for `∀`-introduction. -/
+private def iSupPreIntro? (goal : MVarId) (pre : Expr) : VCGenM (Option MVarId) := do
+  unless pre.isAppOfArity ``Lean.Order.iSup 4 do return none
+  let .goals [g] ← (← read).backwardRules.iSupPreIntro.applyChecked goal
+    | throwError "Failed to eliminate the `iSup` precondition of {goal}"
+  return some g
 
 /-- Strategy 7: move a bare `Prop` precondition `φ ⊑ rhs` into the local context via
 `le_of_imp_top_le`, leaving `⊤ ⊑ rhs`. Runs after `True` and `⊤` preconditions are handled, so
@@ -189,15 +223,19 @@ private def normalizePreToTop? (goal : MVarId) (pre target : Expr) : VCGenM (Opt
 /-- Phase 2: drive the precondition of `pre ⊑ rhs` toward `⊤`, lifting any pure content into the
 local context so a later spec application sees a `⊤` precondition. In order: cancel a redundant
 `⊓ ⊤`; lift an embedded `⌜φ⌝` (before state-argument introduction, which would otherwise leave
-`⌜φ⌝` applied to the introduced state); introduce excess state arguments; drop a `True`
-precondition; lift a bare `Prop` precondition. Returns the updated scope, recording any lifted
-hypothesis. -/
+`⌜φ⌝` applied to the introduced state); lift the guard of a `⌜φ⌝ ⊓ P`; eliminate an `iSup`;
+introduce excess state arguments; drop a `True` precondition; lift a bare `Prop` precondition.
+Returns the updated scope, recording any lifted hypothesis. -/
 private def normalizePre? (scope : VCGen.Scope) (goal : MVarId) (α pre target : Expr) :
     VCGenM (Option (VCGen.Scope × List MVarId)) := do
   if let some g ← stripMeetTopPre? goal pre then
     return some (scope, [g])
   if let some (g, h) ← ofPropPreIntro? goal pre then
     return some ({ scope with lastLiftedPre? := some h }, [g])
+  if let some (g, h) ← ofPropMeetPreIntro? goal pre then
+    return some ({ scope with lastLiftedPre? := some h }, [g])
+  if let some g ← iSupPreIntro? goal pre then
+    return some (scope, [g])
   if let some goal' ← introsExcessArgs goal then return some (scope, [goal'])
   if let some gs ← normalizePreToTop? goal pre target then
     return some (scope, gs)
@@ -409,26 +447,48 @@ public def matchFrame? (resourceTy : Expr) (info : WPApp) : VCGenM (Option Expr)
   return some F
 
 /-- True iff `post` is the post of a frame residual, `fun a => PreservesSup.upperAdjoint (op F) (Q a)`.
-The upper-adjoint frame rule leaves this shape behind, so a program with such a post is already framed
-and must not be framed again. -/
+The frame rule leaves this shape behind, so a program with such a post is already framed and must not
+be framed again. -/
 private def isFramedPost (post : Expr) : Bool :=
   let body := if post.isLambda then post.bindingBody! else post
   body.consumeMData.getAppFn.isConstOf ``Lean.Order.PreservesSup.upperAdjoint
 
-/-- Apply the upper-adjoint frame rule for `fp`'s operator and frame `F`, assigning the schematic frame
-variable to `F`. Returns the frame VCs, the frame condition `WP.Frames op prog F`, and the
-precondition that carries on to the program's own spec. Builds the operator here, since this runs only
-when a frame applies. -/
-private def applyFrameRule (goal : MVarId) (info : WPApp) (fp : FrameProc) (F : Expr) :
-    VCGenM (List MVarId) := do
+/-- Apply the frame rule for `fp`'s operator and the inferred `FrameSplit`, assigning the rule's
+schematic slots by their recorded positions. The frame slot takes `split.frame`. The footprint slot
+takes `split.footprint?` verbatim, leaving the residual VC `footprint ⊑ W` (where
+`W := wp x (fun a => upperAdjoint (op F) (Q a)) E`) as a subgoal; with no footprint it takes `W`
+itself, read off the residual VC's type, and the residual VC closes by reflexivity. The split's
+proof discharges the split VC; its holes, or the whole split VC without a proof, are returned among
+the remaining subgoals. Builds the operator here, since this runs only when a frame applies. -/
+private def applyFrameRule (goal : MVarId) (info : WPApp) (fp : FrameProc)
+    (split : FrameSplit) : VCGenM (List MVarId) := do
   let op ← fp.mkOpAppM info
-  let rule ← mkFrameBackwardRuleCached op info
-  let .goals (fGoal :: rest) ← rule.applyChecked goal m!"frame rule for{indentExpr info.prog}"
+  let frule ← mkFrameBackwardRuleCached op fp.opHead info
+  let .goals goals ← frule.rule.applyChecked goal m!"frame rule for{indentExpr info.prog}"
     | throwError "frame: failed to apply rule for{indentExpr info.prog}"
-  -- `fGoal` is the schematic frame variable, of the operator's resource type `R`; `F` was inferred at
-  -- that same `R`, so it assigns directly without a definitional-equality check.
-  fGoal.assign F
-  return rest
+  let goals := goals.toArray
+  -- The slot subgoals are the rule's schematic metavariables; the split's data was inferred at their
+  -- types, so they assign directly without a definitional-equality check.
+  goals[frule.frameIdx]!.assign split.frame
+  match split.footprint? with
+  | some P₀ => goals[frule.footprintIdx]!.assign P₀
+  | none =>
+    -- The weakest footprint: closing the residual VC `?P ⊑ W` by reflexivity assigns the footprint
+    -- slot `?P := W` as a unification side effect.
+    let some [] ← rfl? goals[frule.residualVCIdx]!
+      | throwError "frame: failed to close the residual VC by reflexivity\
+          {indentExpr (← goals[frule.residualVCIdx]!.getType)}"
+  let mut proofGoals := []
+  if let some proof := split.proof? then
+    let vcGoal := goals[frule.splitVCIdx]!
+    let proofTy ← Sym.inferType proof
+    let vcTy ← instantiateMVarsS (← vcGoal.getType)
+    unless ← isDefEqS proofTy vcTy do
+      throwError "frame: the `FrameSplit` proof has type{indentExpr proofTy}\n\
+        but the split VC is{indentExpr vcTy}"
+    vcGoal.assign proof
+    proofGoals ← (← getMVars proof).toList.filterM fun m => not <$> m.isAssigned
+  goals.toList.filterM (fun g => return !(← g.isAssigned)) <&> (· ++ proofGoals)
 
 /-- The spec precondition instantiated at the call site: the right-hand side of the bare `pre ⊑ specPre`
 premise among a spec rule's subgoals. The post and exception VCs are `∀`-quantified, so the bare
@@ -441,17 +501,24 @@ private def specPreOf? (subgoals : List MVarId) : VCGenM (Option Expr) := do
       return some (← instantiateMVarsIfMVarAppS specPre)
   return none
 
+/-- Instantiate a `FrameSplit` against the current metavariable context (and reshare) so it survives
+rolling back a speculative spec application. -/
+private def instantiateFrameSplit (split : FrameSplit) : VCGenM FrameSplit := do
+  return { frame := ← instantiateMVarsS split.frame
+           footprint? := ← split.footprint?.mapM (instantiateMVarsS ·)
+           proof? := ← split.proof?.mapM (instantiateMVarsS ·) }
+
 /--
 Handle a spec-ready program `info.prog`: select its `@[spec]` theorem and either frame or apply it.
 
 - A spec with a conjunctive precondition, or an already-framed residual, applies its spec directly.
-- Otherwise the frame operator for the monad is selected (the `@[frameproc]` registered for the
+- Otherwise the frame procedure for the monad is selected (the `@[frameproc]` registered for the
   program type, or the default meet frame). The choice is per node, since sub-programs may reach a
   different monad (e.g. a `monadLift`ed base call).
-- An explicit `frames` clause takes precedence, framing eagerly.
-- Failing that, the spec is applied speculatively and its precondition VC `pre ⊑ specPre` is handed to
-  the frame procedure: no frame keeps the application; a frame `F` rolls it back and applies the frame
-  rule instead, so the spec re-applies against the framed residual where its VCs are solvable.
+- An explicit `frames` clause elaborates a frame `F` and passes `some F` to the procedure.
+- Failing that, the spec is applied speculatively and its precondition VC's right-hand side is
+  handed to the procedure: no split keeps the application; a split rolls it back and applies the
+  frame rule instead, so the spec re-applies against the framed residual where its VCs are solvable.
 -/
 private def applyFrameOrSpec (scope : VCGen.Scope) (goal : MVarId) (pre : Expr) (info : WPApp) :
     VCGenM SolveResult := goal.withContext do
@@ -464,24 +531,21 @@ private def applyFrameOrSpec (scope : VCGen.Scope) (goal : MVarId) (pre : Expr) 
   let procs := (← read).frameProcs.byProg
   let fp := info.M.getAppFn.constName?.bind (procs[·]?) |>.getD meetFrameProc
   let resourceTy ← fp.resourceTy info
-  if let some F ← matchFrame? resourceTy info then
-    return .goals scope (← applyFrameRule goal info fp F)
-  let some proc := fp.proc | return ← applySpec scope goal info thm
-  -- Apply the spec speculatively, then let the frame procedure inspect its precondition VC. No frame
-  -- keeps the application; a frame rolls it back and frames instead.
+  if let some frame ← matchFrame? resourceTy info then
+    let some split ← fp.proc resourceTy pre info pre (some frame)
+      | return ← applySpec scope goal info thm
+    return .goals scope (← applyFrameRule goal info fp (← instantiateFrameSplit split))
   let saved ← Meta.saveState
   let .goals _ subgoals ← applySpec scope goal info thm
     | throwError "vcgen: speculative spec application for{indentExpr info.prog} did not produce goals"
-  let frame? ← match ← specPreOf? subgoals with
-    | some specPre => proc resourceTy pre info specPre
-    | none => pure none
-  let some F := frame? | return .goals scope subgoals
-  -- Capture the frame before rolling back: `saved.restore` un-assigns the speculative metavariables,
-  -- so instantiate `F` against them now (and reshare).
-  let F ← instantiateMVarsS F
-  trace[Elab.Tactic.Do.vcgen] "`@[frameproc]` matched {info.prog}; frame:{indentExpr F}"
+  let some specPre ← specPreOf? subgoals | return .goals scope subgoals
+  let some split ← fp.proc resourceTy pre info specPre none | return .goals scope subgoals
+  -- Capture the split before rolling back: `saved.restore` un-assigns the speculative metavariables,
+  -- so instantiate it against them now (and reshare).
+  let split ← instantiateFrameSplit split
+  trace[Elab.Tactic.Do.vcgen] "`@[frameproc]` matched {info.prog}; frame:{indentExpr split.frame}"
   saved.restore
-  return .goals scope (← applyFrameRule goal info fp F)
+  return .goals scope (← applyFrameRule goal info fp split)
 
 /--
 The main VC generation step. Operates on a plain `MVarId` with no knowledge of grind.
@@ -525,11 +589,9 @@ public def solve (scope : VCGen.Scope) (goal : MVarId) : VCGenM SolveResult := g
   let_expr PartialOrder.rel α inst pre rhs := target
     | return .stop (.noEntailment target)
 
-  -- A previous rule application may have assigned the entailment's sides to fresh metavariables
-  -- (e.g. a lattice-split operand). Instantiate those heads so the shape tests below see the
-  -- assigned form.
-  let pre ← instantiateMVarsIfMVarAppS pre
-  let rhs ← instantiateMVarsIfMVarAppS rhs
+  -- A previous rule application may have assigned parts of the entailment to fresh metavariables;
+  -- canonicalize the target before the shape tests below.
+  if let some g ← instantiateGoal? goal target α inst pre rhs then return .goals scope [g]
 
   -- Phase 2: close reflexive goals, then drive `pre` toward `⊤`, lifting any pure content so a
   -- later spec application sees a `⊤` precondition.

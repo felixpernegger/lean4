@@ -338,7 +338,7 @@ theorem always_frame
   (p: ProofTrace → Prop)
   : WP.Frames Lean.Order.meet f (Always' p)
 where
-  conj_wp_le_wp_conj Q E := by
+  op_wp_le_wp_op Q E := by
     simp only [PartialOrder.rel, my_meet_apply, and_imp, Subtype.forall]
     dsimp only [wp, Always', WP.wpTrans]
     simp [my_meet_apply]
@@ -376,24 +376,25 @@ public meta partial def collectAlways (e : Expr) : Array Expr :=
 
 /-- Frame inference for `Traceful`: gather the precondition's `Always' pᵢ` conjuncts and frame by a
 single `Always'` over their conjunction, `Always' (fun tr => p₁ tr ∧ … ∧ pₙ tr)`. -/
-public meta def dyLeanFrameProc : FrameInferenceProc := fun _R pre _info _specPre => do
+public meta def dyLeanFrameProc : FrameInferenceProc := fun _R pre _info _specPre frame? => do
+  if let some frame := frame? then return some { frame }
   match (collectAlways pre).toList with
   | [] => return none
-  | [single] => return some single
+  | [single] => return some { frame := single }
   | a :: rest =>
     let preds := (a :: rest).map (·.appArg!)
     let domTy := (← Meta.inferType preds.head!).bindingDomain!
     let combined ← Meta.withLocalDeclD `tr domTy fun tr => do
       let last :: initRev := (preds.map (fun p => (mkApp p tr).headBeta)).reverse | unreachable!
       Meta.mkLambdaFVars #[tr] (initRev.foldl (fun acc x => mkApp (mkApp (mkConst ``And) x) acc) last)
-    return some (← shareCommon (mkApp a.appFn! combined))
+    return some { frame := ← shareCommon (mkApp a.appFn! combined) }
 
 @[frameproc] public meta def dyLeanFP : FrameProc where
   prog := ``Traceful
   mkOpAppM := fun info => Meta.mkAppOptM ``Lean.Order.meet #[info.Pred, none]
   resourceTy := fun info => pure info.Pred
-  op := { head := ``Lean.Order.meet }
-  proc := some dyLeanFrameProc
+  opHead := ``Lean.Order.meet
+  proc := dyLeanFrameProc
 end DyLeanFrameProc
 
 variable [ExecTraceTypes]

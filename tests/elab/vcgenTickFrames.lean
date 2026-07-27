@@ -191,7 +191,7 @@ theorem frames_costConj [Assertion Pred] [Assertion EPred] [WPMonad m Pred EPred
 theorem tickFrames [Assertion Pred] [Assertion EPred] [WPMonad m Pred EPred]
     {α : Type} (x : TickT m α) (F : Nat) (Q : α → Nat → Pred) (E : EPred) :
     F ⋆ TickT.wp x Q E ⊑ TickT.wp x (fun a => F ⋆ Q a) E :=
-  (frames_costConj (Pred := Pred) (EPred := EPred) x F).conj_wp_le_wp_conj Q E
+  (frames_costConj (Pred := Pred) (EPred := EPred) x F).op_wp_le_wp_op Q E
 
 /-- The sharp cost spec for `tick`: it costs exactly one unit. Threads the held budget `r` through the
 base `tick` spec. -/
@@ -208,8 +208,8 @@ theorem TickT.le_wp_tick' [Assertion Pred] [Assertion EPred] [WPMonad m Pred EPr
 
 /-! ## End-to-end `vcgen` via a registered `@[frameproc]`
 
-`tickFrameProc` holds the current cost as the budget; the registered `costSplit` decomposes a
-`costConj` goal into a budget side goal and a cost-shifted residual. -/
+`tickFrameProc` holds the current cost as the budget; the footprint holds at the shifted cost, and
+`costConj_apply` reduces the split VC to the budget guard and the shifted residual. -/
 
 open Lean.Elab.Tactic.Do.Internal Lean.Elab.Tactic.Do.Internal.VCGen
 
@@ -220,31 +220,42 @@ open Lean.Elab.Tactic.Do.Internal Lean.Elab.Tactic.Do.Internal.VCGen
   intro n
   exact TickT.le_wp_tick' Q E n
 
-/-- The frame inference procedure: hold the budget given by the current cost, the first excess state
-argument of the `Nat → L` cost assertion. -/
-def tickFrameProc : FrameInferenceProc := fun _R _pre info _specPre => do
+/-- The frame inference procedure: hold the budget given by the pinned frame or the current cost, the
+first excess state argument of the `Nat → L` cost assertion. `costConj` shifts the held budget out of
+the cost state, so the footprint is the goal precondition pinned at the shifted cost via
+`mkPointFootprint`. -/
+def tickFrameProc : FrameInferenceProc := fun _R pre info _specPre frame? => do
   unless info.Pred.isArrow && info.Pred.bindingDomain!.isConstOf ``Nat do return none
   let some cost := info.excessArgs[0]? | return none
-  -- Framing the whole cost leaves the residual budget `cost - cost`; skip when that normalizes to
-  -- `0` so the proc does not re-fire on its own residual.
-  let cost ← instantiateMVars cost
-  let thms := ({} : Lean.Meta.Sym.Simp.Theorems).insert
-    (← Lean.Meta.Sym.Simp.mkTheoremFromDecl ``Nat.sub_self)
-  let post := Lean.Meta.Sym.Simp.evalGround >> thms.rewrite
-  let cost := (← Lean.Meta.Sym.simp cost { post }).getResultExpr cost
-  if cost.nat? == some 0 then return none
-  return some cost
+  let budget ← match frame? with
+    | some r => pure r
+    | none => do
+      -- Framing the whole cost leaves the residual budget `cost - cost`; skip when that normalizes
+      -- to `0` so the proc does not re-fire on its own residual.
+      let cost ← instantiateMVars cost
+      let thms := ({} : Lean.Meta.Sym.Simp.Theorems).insert
+        (← Lean.Meta.Sym.Simp.mkTheoremFromDecl ``Nat.sub_self)
+      let post := Lean.Meta.Sym.Simp.evalGround >> thms.rewrite
+      pure ((← Lean.Meta.Sym.simp cost { post }).getResultExpr cost)
+  if budget.nat? == some 0 then return none
+  let shifted ← Meta.mkAppM ``HSub.hSub #[cost, budget]
+  -- The footprint core: the goal precondition, constant in the states.
+  let mut core := pre
+  for arg in info.excessArgs.reverse do
+    core := .lam `u (← Meta.inferType arg) core .default
+  let footprint ← mkPointFootprint (info.excessArgs.set! 0 shifted) (← shareCommon core)
+  return some { frame := budget, footprint? := some footprint }
 
 /-- Register the cost frame inference procedure for `vcgen`, indexed by the `TickT` program type. The
 frame operator `costConj` is built at the base lattice `L` read off the assertion type `Nat → L`, so it
-frames the cost over any base monad. Its `costConj_apply` rewrite unfolds `costConj r b n` to
-`⌜r ≤ n⌝ ⊓ b (n - r)`, inheriting the built-in meet terminal. -/
+frames the cost over any base monad. `costConj_apply` unfolds `costConj r b n` to
+`⌜r ≤ n⌝ ⊓ b (n - r)` when discharging the split VC. -/
 @[frameproc] def tickFP : FrameProc where
   prog := ``TickT
   mkOpAppM := fun info => Meta.mkAppOptM ``costConj #[some info.Pred.bindingBody!, none]
   resourceTy := fun _ => pure (mkConst ``Nat)
-  op := { head := ``costConj, rewrites := #[``costConj_apply] }
-  proc := some tickFrameProc
+  opHead := ``costConj
+  proc := tickFrameProc
 
 /-- End-to-end: plain `vcgen` infers the budget, applies the `costConj` gadget, fires the registered
 `costSplit`, and the meet machinery closes the residual. -/
@@ -268,7 +279,7 @@ run_meta do
   let _ ← SymM.run <| mkLatticeOpRule rhs { head := ``keepFrame, rewrites := #[``keepFrame_apply] }
 
 -- Stripped of its rewrite the operator neither reduces nor closes, so its split would be the identity.
-/-- error: frame operator `keepFrame` neither reduces nor has a registered terminal; its lattice split rule would be the identity -/
+/-- error: lattice operator `keepFrame` neither reduces nor has a registered terminal; its split rule would be the identity -/
 #guard_msgs in
 run_meta do
   let rhs ← Meta.mkAppM ``keepFrame #[mkNatLit 3, mkConst ``keepPred]
